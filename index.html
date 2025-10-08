@@ -82,7 +82,7 @@ const keys = {};
 addEventListener('keydown', e => { keys[e.key.toLowerCase()] = true; if (e.key==='p' || e.key==='P') togglePause(); });
 addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
 
-document.getElementById('startBtn').onclick = startGame;
+document.getElementById('startBtn').onclick = () => { initAudio(); startGame(); };
 document.getElementById('muteBtn').onclick = ()=>{ state.mute = !state.mute; updateMuteBtn(); };
 
 function updateUI(){
@@ -94,21 +94,30 @@ function updateUI(){
 function updateMuteBtn(){ document.getElementById('muteBtn').textContent = state.mute? 'Unmute':'Mute' }
 
 /* -------- Simple sound helper (beeps) -------- */
+let audioCtx;
+function initAudio(){
+    if (audioCtx) return;
+    try {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    } catch(e) { console.error("Web Audio API is not supported in this browser."); }
+}
 function beep(freq=440, dur=0.06, vol=0.06){
-  if(state.mute) return;
-  const a = new (window.AudioContext || window.webkitAudioContext)();
-  const o = a.createOscillator(), g = a.createGain();
-  o.type = 'sine'; o.frequency.value = freq;
-  g.gain.value = vol;
-  o.connect(g); g.connect(a.destination);
-  o.start(); g.gain.exponentialRampToValueAtTime(0.0001, a.currentTime + dur);
-  setTimeout(()=>{ o.stop(); a.close().catch(()=>{}); }, dur*1000+20);
+  if(state.mute || !audioCtx) return;
+  const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+  o.type = 'sine'; o.frequency.setValueAtTime(freq, audioCtx.currentTime);
+  g.gain.setValueAtTime(0, audioCtx.currentTime);
+  g.gain.linearRampToValueAtTime(vol, audioCtx.currentTime + 0.01);
+  o.connect(g); g.connect(audioCtx.destination);
+  o.start();
+  g.gain.exponentialRampToValueAtTime(0.00001, audioCtx.currentTime + dur);
+  o.stop(audioCtx.currentTime + dur + 0.01);
 }
 
 /* -------- Game objects -------- */
 const player = {
-  x: W/2, y: H*0.78, vx:0, vy:0, speed: 220, size:18,
-  reload: 0, reloadTime: 0.25, shield:0, rapid:0
+  x: W/2, y: H*0.78, vx:0, vy:0, speed: 220, size:18, angle: -Math.PI/2,
+  reload: 0, reloadTime: 0.25, shield:0, rapid:0, isMoving: false,
+  invincibleTimer: 0
 };
 
 let bullets = [];
@@ -123,14 +132,14 @@ function dist(a,b,c,d){ return Math.hypot(a-c,b-d); }
 
 /* -------- Game lifecycle -------- */
 function startGame(){
-  // reset
   state.running = true;
   state.paused = false;
   state.score = 0; state.lives = 3; state.level = 1; state.combo = 0;
   player.x = W/2; player.y = H*0.78; player.vx=0; player.vy=0;
-  player.reload=0; player.shield=0; player.rapid=0;
+  player.angle = -Math.PI/2; player.isMoving = false;
+  player.reload=0; player.shield=0; player.rapid=0; player.invincibleTimer = 0;
   bullets=[]; enemies=[]; particles=[]; powerups=[];
-  spawnTimer = 0;
+  spawnTimer = 2.5;
   updateUI();
   loop(0);
 }
@@ -144,6 +153,9 @@ function togglePause(){
 
 /* -------- Entities update & draw -------- */
 function update(dt){
+  // timers
+  if (player.invincibleTimer > 0) player.invincibleTimer -= dt;
+
   // player movement
   const up = keys['w']||keys['arrowup']||false;
   const down = keys['s']||keys['arrowdown']||false;
@@ -154,12 +166,20 @@ function update(dt){
   if(down) ay += 1;
   if(left) ax -= 1;
   if(right) ax += 1;
-  const mag = Math.hypot(ax,ay) || 1;
-  player.vx = (ax/mag) * player.speed;
-  player.vy = (ay/mag) * player.speed;
+
+  if (ax !== 0 || ay !== 0) {
+    const mag = Math.hypot(ax, ay);
+    player.vx = (ax / mag) * player.speed;
+    player.vy = (ay / mag) * player.speed;
+    player.angle = Math.atan2(player.vy, player.vx) + Math.PI/2;
+    player.isMoving = true;
+  } else {
+    player.vx = 0;
+    player.vy = 0;
+    player.isMoving = false;
+  }
   player.x += player.vx * dt;
   player.y += player.vy * dt;
-  // clamp
   player.x = Math.max(20, Math.min(W-20, player.x));
   player.y = Math.max(20, Math.min(H-20, player.y));
 
@@ -169,11 +189,10 @@ function update(dt){
   if(shooting && player.reload <= 0){
     const rt = player.rapid > 0 ? player.reloadTime * 0.35 : player.reloadTime;
     player.reload = rt;
-    // 3-bullet spread if moving quickly
-    fireBullet(player.x, player.y-16, 0);
-    if(Math.abs(player.vx) > 1 || Math.abs(player.vy) > 1) {
-      fireBullet(player.x, player.y-16, -0.12);
-      fireBullet(player.x, player.y-16, 0.12);
+    fireBullet(player.x, player.y, 0, player.angle);
+    if(player.isMoving) {
+      fireBullet(player.x, player.y, -0.15, player.angle);
+      fireBullet(player.x, player.y, 0.15, player.angle);
     }
     beep(960,0.04,0.02);
   }
@@ -193,40 +212,43 @@ function update(dt){
     spawnTimer = Math.max(0.6, 2.6 - state.level*0.12);
   }
 
-  // enemies update (simple homing + pattern)
+  // enemies update
   for(let i=enemies.length-1;i>=0;i--){
     const e = enemies[i];
-    // simple movement toward bottom or toward player
     const angleToPlayer = Math.atan2(player.y - e.y, player.x - e.x);
-    // some enemies chase, some drift
     e.vx += Math.cos(angleToPlayer) * e.acc * dt;
     e.vy += Math.sin(angleToPlayer) * e.acc * dt;
+    
+    // FIX: Add damping/friction to prevent infinite acceleration
+    e.vx *= 0.99;
+    e.vy *= 0.99;
+    
     e.x += e.vx*dt; e.y += e.vy*dt;
     e.life -= dt;
-    // wrap or remove
     if(e.y > H + 60 || e.life<=0) {
-      // if life ran out from timer, remove quietly
       if(e.y <= H+60 && e.life> -999) spawnParticles(e.x,e.y,8);
       enemies.splice(i,1);
       continue;
     }
+    
     // collision with player
-    if(dist(e.x,e.y,player.x,player.y) < e.size + player.size - (player.shield>0?6:0)){
+    // FIX: Check for invincibility
+    if(player.invincibleTimer <= 0 && dist(e.x,e.y,player.x,player.y) < e.size + player.size - 4){
       if(player.shield > 0){
         player.shield = 0;
-        // enemy destroyed
         scoreEnemy(e, true);
         enemies.splice(i,1);
         spawnParticles(e.x,e.y,12);
         beep(220,0.08,0.06);
       } else {
-        // hit player
         state.lives -= 1;
         state.combo = 0;
+        player.vx = 0; player.vy = 0;
+        player.isMoving = false;
+        player.invincibleTimer = 2.0; // Give 2 seconds of invincibility
         updateUI();
         spawnParticles(player.x,player.y,20);
         beep(120,0.18,0.1);
-        // knockback
         player.x = W/2; player.y = H*0.78;
         if(state.lives <= 0){ gameOver(); return; }
         enemies.splice(i,1);
@@ -240,14 +262,12 @@ function update(dt){
     for(let j=bullets.length-1;j>=0;j--){
       const b = bullets[j];
       if(dist(e.x,e.y,b.x,b.y) < e.size + b.r){
-        // hit
         bullets.splice(j,1);
         e.hp -= b.dmg;
         e.colorFlash = 0.08;
         if(e.hp <= 0){
           scoreEnemy(e);
           spawnParticles(e.x,e.y,12);
-          // chance to spawn powerup
           if(Math.random() < 0.12) spawnPowerup(e.x,e.y);
           enemies.splice(i,1);
         }
@@ -261,7 +281,7 @@ function update(dt){
     const p = powerups[i];
     p.y += p.vy * dt;
     p.vy += 30*dt;
-    if(dist(p.x,p.y,player.x,player.y) < 18){
+    if(dist(p.x,p.y,player.x,player.y) < 22){
       applyPowerup(p);
       powerups.splice(i,1);
       beep(720,0.07,0.04);
@@ -280,15 +300,12 @@ function update(dt){
     if(r.life<=0) particles.splice(i,1);
   }
 
-  // power timers
   if(player.shield > 0) player.shield -= dt;
   if(player.rapid > 0) player.rapid -= dt;
 }
 
 function draw(){
-  // clear
   ctx.clearRect(0,0,W,H);
-  // background grid subtle
   ctx.save();
   ctx.globalAlpha = 0.12;
   for(let g=0;g<20;g++){
@@ -301,33 +318,35 @@ function draw(){
   }
   ctx.restore();
 
-  // draw player (triangle)
-  ctx.save();
-  const ang = Math.atan2(player.vy, player.vx) + Math.PI/2;
-  ctx.translate(player.x, player.y);
-  ctx.rotate(ang);
-  // shield
-  if(player.shield>0){
+  // FIX: Make player flash when invincible
+  if (player.invincibleTimer > 0 && Math.floor(player.invincibleTimer * 10) % 2 === 1) {
+    // Skip drawing the player to create a flashing effect
+  } else {
+    // draw player
+    ctx.save();
+    ctx.translate(player.x, player.y);
+    ctx.rotate(player.angle);
+    if(player.shield>0){
+      ctx.beginPath();
+      ctx.arc(0,0,player.size+8,0,Math.PI*2);
+      ctx.fillStyle = 'rgba(110,231,183,0.08)';
+      ctx.fill();
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = 'rgba(110,231,183,0.28)';
+      ctx.stroke();
+    }
     ctx.beginPath();
-    ctx.arc(0,0,player.size+8,0,Math.PI*2);
-    ctx.fillStyle = 'rgba(110,231,183,0.08)';
+    ctx.moveTo(0,-player.size);
+    ctx.lineTo(player.size*0.7, player.size);
+    ctx.lineTo(-player.size*0.7, player.size);
+    ctx.closePath();
+    ctx.fillStyle = '#dfffe8';
     ctx.fill();
-    ctx.lineWidth = 2;
-    ctx.strokeStyle = 'rgba(110,231,183,0.28)';
+    ctx.lineWidth = 1.2;
+    ctx.strokeStyle = '#56cfa0';
     ctx.stroke();
+    ctx.restore();
   }
-  // ship
-  ctx.beginPath();
-  ctx.moveTo(0,-player.size);
-  ctx.lineTo(player.size*0.7, player.size);
-  ctx.lineTo(-player.size*0.7, player.size);
-  ctx.closePath();
-  ctx.fillStyle = '#dfffe8';
-  ctx.fill();
-  ctx.lineWidth = 1.2;
-  ctx.strokeStyle = '#56cfa0';
-  ctx.stroke();
-  ctx.restore();
 
   // bullets
   for(const b of bullets){
@@ -341,7 +360,6 @@ function draw(){
   for(const e of enemies){
     ctx.save();
     ctx.translate(e.x,e.y);
-    // flash when hit
     const alpha = Math.max(0.08, 0.9 - (e.colorFlash||0)*8);
     if(e.colorFlash) e.colorFlash -= 0.016;
     ctx.beginPath();
@@ -351,7 +369,6 @@ function draw(){
     ctx.lineWidth = 2;
     ctx.strokeStyle = '#111827';
     ctx.stroke();
-    // health bar
     ctx.beginPath();
     ctx.rect(-e.size, -e.size-8, (e.hp/e.maxHp)*e.size*2, 4);
     ctx.fillStyle = '#6ee7b7';
@@ -380,7 +397,7 @@ function draw(){
     ctx.globalAlpha = 1;
   }
 
-  // HUD small
+  // HUD
   ctx.fillStyle = 'rgba(255,255,255,0.06)';
   ctx.fillRect(14,14,190,56);
   ctx.fillStyle = '#cfe';
@@ -390,10 +407,10 @@ function draw(){
 }
 
 /* -------- Helpers: firing, spawn, scoring, powerups, particles -------- */
-function fireBullet(x,y,spread=0){
-  const angle = -Math.PI/2 + spread;
+function fireBullet(x,y,spread=0, baseAngle){
+  const angle = baseAngle - Math.PI/2 + spread;
   const speed = 520;
-  bullets.push({ x, y, vx: Math.cos(angle)*speed, vy: Math.sin(angle)*speed, r:4, life:1.6, dmg: 1 });
+  bullets.push({ x:x-Math.sin(baseAngle)*16, y:y+Math.cos(baseAngle)*16, vx: Math.cos(angle)*speed, vy: Math.sin(angle)*speed, r:4, life:1.6, dmg: 1 });
 }
 
 function spawnWave(){
@@ -413,7 +430,6 @@ function spawnWave(){
     };
     enemies.push(e);
   }
-  // level increases slowly based on score
   if(state.score >= state.level * 120) state.level++;
 }
 
@@ -425,7 +441,6 @@ function scoreEnemy(e, shieldKill=false){
   updateUI();
 }
 
-/* small heuristic */
 function distanceToBottom(e){ return H - e.y; }
 
 function spawnParticles(x,y,n){
@@ -448,7 +463,7 @@ function spawnPowerup(x,y){
 
 function applyPowerup(p){
   if(p.type==='life'){ state.lives = Math.min(9, state.lives + 1); }
-  if(p.type==='rapid'){ player.rapid = 6.2; } // faster shooting
+  if(p.type==='rapid'){ player.rapid = 6.2; }
   if(p.type==='shield'){ player.shield = 3.5; }
   updateUI();
 }
@@ -457,15 +472,22 @@ function applyPowerup(p){
 function gameOver(){
   state.running = false;
   beep(140,0.4,0.08);
-  // mini flash
-  ctx.fillStyle = 'rgba(8,4,6,0.8)';
-  ctx.fillRect(0,0,W,H);
-  ctx.fillStyle = '#fff';
-  ctx.font = '36px system-ui';
-  ctx.fillText('GAME OVER', W/2 - 120, H/2 - 8);
-  ctx.font = '16px system-ui';
-  ctx.fillText(`Final Score: ${state.score}`, W/2 - 70, H/2 + 20);
+  setTimeout(() => { // Delay to ensure final draw call completes
+    ctx.fillStyle = 'rgba(8,4,6,0.8)';
+    ctx.fillRect(0,0,W,H);
+    ctx.fillStyle = '#fff';
+    ctx.textAlign = 'center';
+    ctx.font = '36px system-ui';
+    ctx.fillText('GAME OVER', W/2, H/2 - 20);
+    ctx.font = '16px system-ui';
+    ctx.fillText(`Final Score: ${state.score}`, W/2, H/2 + 20);
+    ctx.font = '14px system-ui';
+    // FIX: Add restart message
+    ctx.fillText('Press "Start / Restart" to play again', W/2, H/2 + 50);
+    ctx.textAlign = 'left';
+  }, 50);
 }
+
 
 /* -------- Game loop -------- */
 let last = 0;
@@ -475,11 +497,13 @@ function loop(t){
     ctx.fillStyle = 'rgba(4,6,8,0.5)';
     ctx.fillRect(0,0,W,H);
     ctx.fillStyle = '#fff';
+    ctx.textAlign = 'center';
     ctx.font = '28px system-ui';
-    ctx.fillText('PAUSED', W/2 - 52, H/2);
+    ctx.fillText('PAUSED', W/2, H/2);
+    ctx.textAlign = 'left';
     return;
   }
-  const dt = Math.min(0.04, (t - last) / 1000 || 0.016);
+  const dt = Math.min(0.05, (t - last) / 1000 || 1/60);
   last = t;
   update(dt);
   draw();
